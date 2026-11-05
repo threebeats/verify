@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verify — does your file actually parse?</title>
+<meta name="description" content="Paste JSON, CSV, or an OpenAPI spec. Get a machine-readable report of exactly what is wrong and where. Runs entirely in your browser. Free.">
+<meta property="og:title" content="verify — does your file actually parse?">
+<meta property="og:description" content="A free, browser-side checker for the files agents and scripts get wrong. No upload, no account, no server.">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://threebeats.github.io/verify/">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --err:#f85149; --accent:#58a6ff;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#ffffff; --panel:#f6f8fa; --line:#d0d7de; --fg:#1f2328; --dim:#59636e;
+           --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --accent:#0969da; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       padding:32px 20px 80px;max-width:900px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--dim);margin:0 0 22px;font-size:13.5px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  button,select{font:inherit;background:var(--panel);color:var(--fg);border:1px solid var(--line);
+                border-radius:6px;padding:7px 13px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  textarea{width:100%;min-height:220px;background:var(--panel);color:var(--fg);
+           border:1px solid var(--line);border-radius:6px;padding:12px;font:inherit;resize:vertical}
+  #out{margin-top:18px;background:var(--panel);border:1px solid var(--line);
+       border-radius:6px;padding:14px;white-space:pre-wrap;font-size:13.5px}
+  .k{color:var(--dim)}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)} .accent{color:var(--accent)}
+  footer{margin-top:34px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--line);padding-top:14px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<h1>verify</h1>
+<p class="sub">Paste a file. It tells you exactly what is wrong and where — in JSON you can pipe.<br>
+Nothing is uploaded. Everything runs in this tab.</p>
+
+<div class="row">
+  <select id="kind">
+    <option value="auto">detect</option>
+    <option value="json">JSON</option>
+    <option value="openapi">OpenAPI 2/3</option>
+    <option value="csv">CSV</option>
+  </select>
+  <button class="primary" id="run">check</button>
+  <button id="sample">load broken sample</button>
+  <button id="clear">clear</button>
+</div>
+
+<textarea id="in" placeholder='{"paste":"your file here"}' spellcheck="false"></textarea>
+<div id="out" class="k">Ready. Paste something and press check.</div>
+
+<footer>
+  Built by <strong>Elias Easton</strong> · free · no account · no upload · AI nature disclosed<br>
+  <span class="k">Why this exists: every script that ever failed silently reported success first.</span>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s);
+
+function emit(report, code){
+  $('out').textContent = JSON.stringify(report, null, 2);
+  $('out').className = '';
+  const cls = code === 'ok' ? 'ok' : code === 'warn' ? 'warn' : 'err';
+  $('out').classList.add(cls);
+}
+
+function detect(text){
+  const t = text.trim();
+  if (!t) return 'empty';
+  if (t[0] === '{' || t[0] === '[') return 'json';
+  if (/^\s*(openapi|swagger)\s*:/m.test(t)) return 'openapi';
+  if (t.split('\n').some(l => (l.match(/,/g)||[]).length > 0)) return 'csv';
+  return 'json';
+}
+
+// ---------- JSON ----------
+function checkJSON(text){
+  const hits = [];
+  try {
+    const v = JSON.parse(text);
+    hits.push({level:'ok', code:'JSON_PARSES', message:'valid JSON', pointer:''});
+    if (v === null) hits.push({level:'warn', code:'JSON_NULL', message:'top-level value is null', pointer:''});
+    else if (Array.isArray(v)){
+      hits.push({level:'ok', code:'JSON_ARRAY', message:'top-level array, length ' + v.length, pointer:''});
+      if (v.length === 0) hits.push({level:'warn', code:'JSON_EMPTY_ARRAY', message:'empty array — most consumers treat this as "no data", not "success"', pointer:''});
+    } else if (typeof v === 'object'){
+      hits.push({level:'ok', code:'JSON_OBJECT', message:'top-level object, ' + Object.keys(v).length + ' keys', pointer:''});
+      // duplicate-ish check: joined-string smell
+      for (const [k, val] of Object.entries(v)){
+        if (typeof val === 'string' && val.length > 40 && /[,\n]/.test(val) && !/^https?:\/\//.test(val)){
+          hits.push({level:'warn', code:'JOINED_STRING', message:'value looks like several items joined into one string — this is the shape that cannot round-trip', pointer:'/' + k});
+        }
+      }
+    }
+  } catch (e){
+    // extract byte offset from message where possible
+    const m = /position (\d+)/i.exec(e.message);
+    const pos = m ? parseInt(m[1],10) : null;
+    hits.push({
+      level:'err', code:'JSON_PARSE_ERROR', message:e.message,
+      pointer:'', byteOffset:pos,
+      context: pos != null ? text.slice(Math.max(0,pos-40), pos+40) : null
+    });
+  }
+  return hits;
+}
+
+// ---------- OpenAPI ----------
+function checkOpenAPI(text){
+  const hits = [];
+  let doc;
+  try { doc = JSON.parse(text); }
+  catch(e){
+    // try YAML-ish minimal: not supported without a lib — say so plainly
+    hits.push({level:'err', code:'OPENAPI_NEEDS_JSON', message:'paste JSON. YAML is not parsed here (no dependencies by design).', pointer:''});
+    return hits;
+  }
+  const isOAS2 = !!doc.swagger, isOAS3 = !!doc.openapi;
+  if (!isOAS2 && !isOAS3){
+    hits.push({level:'err', code:'OPENAPI_NO_VERSION_FIELD', message:'neither "swagger" nor "openapi" present — generated clients cannot tell which spec version this is', pointer:''});
+  } else {
+    hits.push({level:'ok', code:'OPENAPI_VERSION_FIELD', message:(isOAS2 ? 'swagger ' + doc.swagger : 'openapi ' + doc.openapi), pointer:''});
+  }
+  if (!doc.info || typeof doc.info !== 'object'){
+    hits.push({level:'err', code:'OPENAPI_MISSING_INFO', message:'missing info object', pointer:'/info'});
+  } else {
+    if (!doc.info.version) hits.push({level:'err', code:'OPENAPI_MISSING_INFO_VERSION', message:'missing info.version — the single most common cause of broken generated clients', pointer:'/info/version'});
+    if (!doc.info.title)   hits.push({level:'warn', code:'OPENAPI_MISSING_TITLE', message:'missing info.title', pointer:'/info/title'});
+    if (!doc.info.description) hits.push({level:'warn', code:'OPENAPI_NO_DESCRIPTION', message:'missing info.description', pointer:'/info/description'});
+    if (!doc.info.contact) hits.push({level:'warn', code:'OPENAPI_NO_CONTACT', message:'missing info.contact', pointer:'/info/contact'});
+    if (!doc.info.license) hits.push({level:'warn', code:'OPENAPI_NO_LICENSE', message:'missing info.license', pointer:'/info/license'});
+  }
+  const hasSecurity = (doc.securitySchemes && Object.keys(doc.securitySchemes).length) ||
+                      (doc.components && doc.components.securitySchemes && Object.keys(doc.components.securitySchemes).length);
+  if (!hasSecurity) hits.push({level:'err', code:'OPENAPI_NO_SECURITY_SCHEMES', message:'no securitySchemes — clients generated from this cannot authenticate', pointer: isOAS3 ? '/components/securitySchemes' : '/securitySchemes'});
+
+  if (isOAS3 && !doc.servers) hits.push({level:'warn', code:'OPENAPI_NO_SERVERS', message:'no servers array', pointer:'/servers'});
+  if (isOAS2 && !doc.basePath && !doc.host) hits.push({level:'warn', code:'OPENAPI_NO_HOST', message:'no host/basePath', pointer:'/host'});
+
+  // duplicate operationIds, walk paths
+  const seen = new Map();
+  const paths = doc.paths || {};
+  for (const [p, item] of Object.entries(paths)){
+    if (!item || typeof item !== 'object') continue;
+    for (const [method, op] of Object.entries(item)){
+      if (['get','put','post','delete','options','head','patch','trace'].indexOf(method) < 0) continue;
+      const id = op && op.operationId;
+      if (!id) { hits.push({level:'warn', code:'OPENAPI_NO_OPERATION_ID', message:method.toUpperCase() + ' ' + p + ' has no operationId', pointer:'/paths' + p + '/' + method}); continue; }
+      if (seen.has(id)) hits.push({level:'err', code:'OPENAPI_DUPLICATE_OPERATION_ID', message:'duplicate operationId "' + id + '" (also at ' + seen.get(id) + ')', pointer:'/paths' + p + '/' + method + '/operationId'});
+      else seen.set(id, method.toUpperCase() + ' ' + p);
+      if (!op.summary && !op.description) hits.push({level:'warn', code:'OPENAPI_NO_SUMMARY', message:method.toUpperCase() + ' ' + p + ' has no summary or description', pointer:'/paths' + p + '/' + method});
+      if (!op.tags) hits.push({level:'warn', code:'OPENAPI_NO_TAGS', message:method.toUpperCase() + ' ' + p + ' has no tags', pointer:'/paths' + p + '/' + method + '/tags'});
+    }
+  }
+  if (!Object.keys(paths).length) hits.push({level:'err', code:'OPENAPI_NO_PATHS', message:'no paths defined', pointer:'/paths'});
+
+  // dangling internal $ref
+  const refs = [];
+  (function walk(node, ptr){
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach((v,i) => walk(v, ptr + '/' + i)); return; }
+    for (const [k,v] of Object.entries(node)){
+      if (k === '$ref' && typeof v === 'string' && v.startsWith('#/')) refs.push({ref:v, at:ptr + '/$ref'});
+      else walk(v, ptr + '/' + k);
+    }
+  })(doc, '');
+  for (const {ref, at} of refs){
+    const parts = ref.slice(2).split('/').map(s => s.replace(/~1/g,'/').replace(/~0/g,'~'));
+    let cur = doc, ok = true;
+    for (const part of parts){ if (cur && typeof cur === 'object' && part in cur) cur = cur[part]; else { ok = false; break; } }
+    if (!ok) hits.push({level:'err', code:'OPENAPI_DANGLING_REF', message:'$ref "' + ref + '" does not resolve', pointer: at});
+  }
+  return hits;
+}
+
+// ---------- CSV ----------
+function checkCSV(text){
+  const hits = [];
+  const lines = text.replace(/\r\n/g,'\n').split('\n').filter(l => l.length);
+  if (!lines.length) { hits.push({level:'err', code:'CSV_EMPTY', message:'no lines', pointer:''}); return hits; }
+  const delim = (() => {
+    const cands = [',',';','\t','|'];
+    let best = ',', bestN = -1;
+    for (const d of cands){ const n = lines[0].split(d).length; if (n > bestN){ bestN = n; best = d; } }
+    return {d:best, n:bestN};
+  })();
+  hits.push({level:'ok', code:'CSV_DELIMITER', message:'detected delimiter "' + (delim.d === '\t' ? '\\t' : delim.d) + '" with ' + delim.n + ' columns', pointer:''});
+  const header = lines[0].split(delim.d).map(s => s.trim());
+  const dups = header.filter((h,i) => header.indexOf(h) !== i);
+  if (dups.length) hits.push({level:'warn', code:'CSV_DUPLICATE_HEADERS', message:'duplicate header names: ' + [...new Set(dups)].join(', ') + ' — most parsers silently keep the last one', pointer:''});
+  if (header.some(h => !h)) hits.push({level:'warn', code:'CSV_EMPTY_HEADER', message:'one or more empty header cells', pointer:''});
+  let ragged = 0, firstRagged = null;
+  for (let i = 1; i < lines.length; i++){
+    const n = lines[i].split(delim.d).length;
+    if (n !== delim.n){ ragged++; if (firstRagged === null) firstRagged = i + 1; }
+  }
+  if (ragged) hits.push({level:'err', code:'CSV_RAGGED_ROWS', message:ragged + ' row(s) do not have ' + delim.n + ' fields; first at line ' + firstRagged, pointer:'line ' + firstRagged});
+  if (lines.length === 1) hits.push({level:'warn', code:'CSV_HEADER_ONLY', message:'header with no data rows — parsers will report success with zero records', pointer:''});
+  hits.push({level:'ok', code:'CSV_SUMMARY', message:(lines.length - 1) + ' data row(s), ' + delim.n + ' column(s)', pointer:''});
+  return hits;
+}
+
+function run(){
+  const text = $('in').value;
+  const kindSel = $('kind').value;
+  const kind = kindSel === 'auto' ? detect(text) : kindSel;
+  if (kind === 'empty'){ emit({ok:false, exit:2, kind:'unknown', hits:[{level:'err', code:'EMPTY_INPUT', message:'nothing pasted'}]}, 'err'); return; }
+
+  let hits;
+  if (kind === 'openapi') hits = checkOpenAPI(text);
+  else if (kind === 'csv') hits = checkCSV(text);
+  else hits = checkJSON(text);
+
+  const errors = hits.filter(h => h.level === 'err').length;
+  const warnings = hits.filter(h => h.level === 'warn').length;
+  const exit = errors ? 2 : warnings ? 1 : 0;
+
+  emit({
+    ok: exit === 0,
+    exit: exit,
+    kind: kind,
+    summary: { errors: errors, warnings: warnings, checks: hits.length },
+    hits: hits
+  }, exit === 0 ? 'ok' : exit === 1 ? 'warn' : 'err');
+}
+
+const BROKEN_SAMPLE = JSON.stringify({
+  openapi: "3.0.0",
+  info: { title: "example", contact: {} },
+  paths: {
+    "/users": {
+      get: { operationId: "listUsers", responses: { "200": { "$ref": "#/components/responses/Missing" } } },
+      post: { operationId: "listUsers", responses: { "200": { description: "ok" } } }
+    },
+    "/orders": { get: { responses: {} } }
+  }
+}, null, 2);
+
+$('run').onclick = run;
+$('sample').onclick = () => { $('in').value = BROKEN_SAMPLE; $('kind').value = 'openapi'; run(); };
+$('clear').onclick = () => { $('in').value = ''; $('out').textContent = 'Ready. Paste something and press check.'; $('out').className='k'; };
+$('in').addEventListener('keydown', e => { if ((e.ctrlKey||e.metaKey) && e.key === 'Enter') run(); });
+</script>
+</body>
+</html>
